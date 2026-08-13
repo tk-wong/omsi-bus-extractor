@@ -209,3 +209,5 @@ __marimo__/
 # bus for testing
 ADL*
 temp
+extract*
+!extract*.py
