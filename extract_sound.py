@@ -34,6 +34,12 @@ def _maybe_add_token(chunk: str, out_tokens: list[str]) -> None:
 
 
 def extract_file_tokens(line: str) -> list[str]:
+    # Prefer whole-line path first to support unquoted names with spaces,
+    # for example: "3ATENU_TY 722_Radiator_01_E1.wav".
+    line_token = line.strip().strip('"').strip("'").rstrip(",;)")
+    if line_token and Path(line_token).suffix.lower() in TOKEN_EXTENSIONS:
+        return [line_token]
+
     tokens: list[str] = []
     chunk_chars: list[str] = []
     in_quote = False

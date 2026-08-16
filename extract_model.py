@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
+import struct
 
 
 MODEL_EXTENSIONS = {".o3d", ".cfg"}
@@ -68,35 +71,148 @@ def extract_file_tokens(line: str) -> list[str]:
     return tokens
 
 
-def extract_texture_tokens_from_binary(text: str) -> set[str]:
-    lower_text = text.lower()
+def extract_texture_tokens_from_binary(content: bytes | str) -> set[str]:
+    """Parses .o3d binary content by scanning for Pascal-style string length
+
+    prefixes and material tags to avoid capturing chunk markers like 'HB' or
+    'HC'.
+    """
+    if isinstance(content, str):
+        content_bytes = content.encode("latin-1", errors="ignore")
+    else:
+        content_bytes = content
+
     matches: set[str] = set()
-    allowed_chars = set(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./\\- ")
+    length = len(content_bytes)
 
     for ext in TEXTURE_EXTENSIONS:
+        ext_bytes = ext.encode("ascii")
+        ext_len = len(ext_bytes)
         search_from = 0
-        ext_lower = ext.lower()
 
         while True:
-            idx = lower_text.find(ext_lower, search_from)
+            # Find the extension in the binary stream (case-insensitive search)
+            idx = content_bytes.lower().find(ext_bytes, search_from)
             if idx == -1:
                 break
 
-            start = idx - 1
-            while start >= 0 and text[start] in allowed_chars:
-                start -= 1
-            start += 1
+            # In Pascal strings (used by Delphi/OMSI), 1 byte before the string specifies its length.
+            # We test potential string lengths around the match position.
+            end_pos = idx + ext_len
 
-            end = idx + len(ext)
-            token = text[start:end].strip().strip('"').strip("'")
-            if token and Path(token).suffix.lower() == ext_lower:
-                matches.add(token)
+            # Check candidate starting points backward from the match
+            for start_pos in range(max(0, idx - 255), idx):
+                str_len = end_pos - start_pos
 
-            search_from = idx + len(ext)
+                # Verify if the byte immediately preceding start_pos matches str_len
+                if start_pos > 0 and content_bytes[start_pos - 1] == str_len:
+                    candidate_bytes = content_bytes[start_pos:end_pos]
 
-    return matches
+                    try:
+                        decoded = candidate_bytes.decode("ascii").strip()
+                        cleaned = normalize_rel_path(decoded)
 
+                        if (
+                            cleaned
+                            and Path(cleaned).suffix.lower()
+                            in TEXTURE_EXTENSIONS
+                        ):
+                            matches.add(cleaned)
+                            break  # Found exact length-prefixed string match
+                    except UnicodeDecodeError:
+                        continue
+
+            search_from = idx + ext_len
+
+    # Fallback/Safety Net: If length-prefix matching yielded nothing,
+    # strip known 2-letter chunk prefixes like HB, HC, etc., followed by garbage bytes
+    cleaned_matches: set[str] = set()
+    for match in matches:
+        # Trim leading garbage if it matched HB/HC markers
+        clean_name = match
+        if len(clean_name) > 3 and clean_name[:2] in {"HB", "HC"}:
+            clean_name = clean_name[2:].lstrip(" \t\x00\x01\x02\x03\x04\x05'\"")
+
+        cleaned_matches.add(clean_name)
+
+    return cleaned_matches
+
+# todo: fix parsing the texture from o3d
+# reference: https://github.com/lmaodick1239/OMSI-FilePacker
+def extract_textures_from_o3d(file_path: Path):
+    """Parse textures from O3D files handling both rigid and fluid parts."""
+    data = file_path.read_bytes()
+    ascii_text = data.decode("latin-1", errors="ignore")
+    
+    # 1. Parse rigid part materials (material block markers)
+    material_matches = set(re.finditer(r'\.(r|l)(\d+)', ascii_text))
+    
+    # 2. Parse fluid part textures (determine displacement state)
+    fluid_textures = set()
+    with file_path.open("r", encoding="latin-1") as f:
+        for line in f:
+            if line.strip().startswith("Displacement="):
+                # Extract displacement file extension
+                match = re.search(r'Displacement="([^"]+)"', line)
+                if match:
+                    rel_path = match.group(1)
+                    candidate = file_path.parent / Path(rel_path).parent / Path(rel_path).name
+                    if candidate.suffix.lower() in TEXTURE_EXTENSIONS:
+                        fluid_textures.add(candidate)
+    
+    return material_matches | fluid_textures
+
+
+def _parse_blender_o3d(buff: bytes, header_idx: int) -> set[str]:
+    """Fallback handler for Blender-generated OMSIS3D files."""
+    offset = header_idx + 7
+    if offset < len(buff) and buff[offset] in (0x00, 0x0A, 0x0D):
+        offset += 1
+
+    version, num_sections = struct.unpack_from("<HH", buff, offset=offset)
+    offset += 4
+    l_header = version >= 3
+    if l_header:
+        offset += 5
+
+    textures = set()
+    for _ in range(num_sections):
+        if offset >= len(buff):
+            break
+        sec_type = buff[offset]
+        offset += 1
+
+        if sec_type == 0x17:
+            num = struct.unpack_from("<I" if l_header else "<H", buff, offset)[0]
+            offset += (4 if l_header else 2) + (num * 32)
+        elif sec_type == 0x18:
+            num = struct.unpack_from("<I" if l_header else "<H", buff, offset)[0]
+            offset += (4 if l_header else 2) + (num * 6)
+        elif sec_type == 0x19:
+            num_mats = struct.unpack_from("<H", buff, offset)[0]
+            offset += 2
+            for _ in range(num_mats):
+                offset += 44  # Skip color floats
+                path_len = buff[offset]
+                offset += 1
+                if path_len > 0:
+                    raw = buff[offset : offset + path_len]
+                    offset += path_len
+                    tex = raw.decode("cp1252", errors="ignore").strip().replace("/", "\\")
+                    if tex:
+                        textures.add(tex)
+        elif sec_type == 0x1A:
+            num = struct.unpack_from("<I" if l_header else "<H", buff, offset)[0]
+            offset += (4 if l_header else 2)
+            for _ in range(num):
+                b_len = buff[offset]
+                offset += 1 + b_len
+                weights = struct.unpack_from("<H", buff, offset)[0]
+                offset += 2 + (weights * 6)
+        elif sec_type == 0x1B:
+            offset += 64
+
+    return textures
 
 def find_first_bus_file(bus_root: Path) -> Path:
     bus_files = sorted(bus_root.glob("*.bus"))
@@ -294,7 +410,7 @@ def gather_textures(
     resolved_textures: set[Path] = set()
 
     for o3d_file in o3d_files:
-        all_tokens.update(parse_o3d_textures(o3d_file))
+        all_tokens.update(extract_textures_from_o3d(o3d_file))
 
     for token in sorted(all_tokens):
         if Path(token).suffix.lower() not in TEXTURE_EXTENSIONS:
