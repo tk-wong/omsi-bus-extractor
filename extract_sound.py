@@ -18,6 +18,21 @@ def normalize_rel_path(path_text: str) -> str:
     return text
 
 
+def is_within_bus_root(path: Path, bus_root: Path) -> bool:
+    try:
+        path.resolve().relative_to(bus_root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_within_bus_root(candidate: Path, bus_root: Path) -> Path | None:
+    resolved = candidate.resolve()
+    if is_within_bus_root(resolved, bus_root):
+        return resolved
+    return None
+
+
 def is_comment_or_empty(line: str) -> bool:
     stripped = line.strip()
     return not stripped or stripped.startswith(";") or stripped.startswith("//")
@@ -81,7 +96,12 @@ def find_first_bus_file(bus_root: Path) -> Path:
     return bus_files[0]
 
 
-def resolve_existing_path(raw_path: str, base_dir: Path, bus_root: Path) -> Path | None:
+def resolve_existing_path(
+        raw_path: str,
+        base_dir: Path,
+        bus_root: Path,
+        out_of_bus: set[str] | None = None,
+) -> Path | None:
     raw_rel = normalize_rel_path(raw_path)
     rel_no_lead = raw_rel.lstrip("\\")
     candidate_values = []
@@ -104,13 +124,19 @@ def resolve_existing_path(raw_path: str, base_dir: Path, bus_root: Path) -> Path
         candidate_values.append(bus_root / "Sound" / trimmed)
 
     checked = set()
+    any_within_bus = False
     for candidate in candidate_values:
         resolved = candidate.resolve()
         if resolved in checked:
             continue
         checked.add(resolved)
+        if not is_within_bus_root(resolved, bus_root):
+            continue
+        any_within_bus = True
         if resolved.exists() and resolved.is_file():
             return resolved
+    if not any_within_bus and out_of_bus is not None:
+        out_of_bus.add(raw_rel)
     return None
 
 
@@ -168,13 +194,15 @@ def resolve_sound_token(
         sound_root: Path,
         by_relpath: dict[str, Path],
         by_basename: dict[str, list[Path]],
+        out_of_bus: set[str] | None = None,
 ) -> set[Path]:
     normalized = normalize_rel_path(token).lstrip("\\")
     lower_rel = normalized.replace("\\", "/").lower()
     file_name = Path(normalized).name.lower()
     candidates: set[Path] = set()
 
-    direct_resolved = resolve_existing_path(token, base_dir, bus_root)
+    direct_resolved = resolve_existing_path(
+        token, base_dir, bus_root, out_of_bus=out_of_bus)
     if direct_resolved:
         candidates.add(direct_resolved)
 
@@ -186,7 +214,10 @@ def resolve_sound_token(
         candidates.add(rel_match)
 
     direct_under_sound = (sound_root / normalized).resolve()
-    if direct_under_sound.exists() and direct_under_sound.is_file():
+    if not is_within_bus_root(direct_under_sound, bus_root):
+        if out_of_bus is not None:
+            out_of_bus.add(normalized)
+    elif direct_under_sound.exists() and direct_under_sound.is_file():
         candidates.add(direct_under_sound)
 
     # Fallback by filename to tolerate mixed or omitted subfolder references.
@@ -199,10 +230,11 @@ def resolve_sound_token(
 def parse_sound_dependencies(
         start_cfgs: set[Path],
         bus_root: Path,
-) -> tuple[set[Path], set[Path], set[str]]:
+) -> tuple[set[Path], set[Path], set[str], set[str]]:
     all_cfgs: set[Path] = set()
     all_audio: set[Path] = set()
     unresolved_tokens: set[str] = set()
+    out_of_bus: set[str] = set()
 
     sound_root = bus_root / "sound"
     if not sound_root.exists():
@@ -232,6 +264,7 @@ def parse_sound_dependencies(
                     sound_root,
                     by_relpath,
                     by_basename,
+                    out_of_bus=out_of_bus,
                 )
 
                 if not matches:
@@ -245,7 +278,7 @@ def parse_sound_dependencies(
                 else:
                     all_audio.update(matches)
 
-    return all_cfgs, all_audio, unresolved_tokens
+    return all_cfgs, all_audio, unresolved_tokens, out_of_bus
 
 
 def print_relative_file_list(title: str, files: set[Path], bus_root: Path) -> None:
@@ -254,9 +287,18 @@ def print_relative_file_list(title: str, files: set[Path], bus_root: Path) -> No
         print(f"  {file_path.relative_to(bus_root).as_posix()}")
 
 
-def copy_files_to_output(files: set[Path], bus_root: Path, output_dir: Path) -> None:
+def copy_files_to_output(
+        files: set[Path],
+        bus_root: Path,
+        output_dir: Path,
+        out_of_bus: set[str] | None = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for source in files:
+        if not is_within_bus_root(source, bus_root):
+            if out_of_bus is not None:
+                out_of_bus.add(str(source))
+            continue
         relative = source.relative_to(bus_root)
         target = output_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -305,7 +347,7 @@ def main() -> None:
     if not sound_cfgs:
         raise RuntimeError(f"No sound cfg references found in: {bus_file}")
 
-    cfg_files, audio_files, unresolved = parse_sound_dependencies(
+    cfg_files, audio_files, unresolved, out_of_bus = parse_sound_dependencies(
         sound_cfgs, bus_root)
 
     print(f"Bus root: {bus_root}")
@@ -322,8 +364,14 @@ def main() -> None:
         for item in sorted(unresolved):
             print(f"  {item}")
 
+    if out_of_bus:
+        print(f"\ntexture/file out of bus ({len(out_of_bus)}):")
+        for item in sorted(out_of_bus):
+            print(f"  {item}")
+
     files_to_copy = cfg_files | audio_files
-    copy_files_to_output(files_to_copy, bus_root, output_dir)
+    copy_files_to_output(
+        files_to_copy, bus_root, output_dir, out_of_bus=out_of_bus)
     print(f"\nCopied {len(files_to_copy)} files to: {output_dir}")
 
 

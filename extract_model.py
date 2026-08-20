@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -21,6 +20,21 @@ def normalize_rel_path(path_text: str) -> str:
     return text
 
 
+def is_within_bus_root(path: Path, bus_root: Path) -> bool:
+    try:
+        path.resolve().relative_to(bus_root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_within_bus_root(candidate: Path, bus_root: Path) -> Path | None:
+    resolved = candidate.resolve()
+    if is_within_bus_root(resolved, bus_root):
+        return resolved
+    return None
+
+
 def is_comment_or_empty(line: str) -> bool:
     stripped = line.strip()
     return not stripped or stripped.startswith(";") or stripped.startswith("//")
@@ -37,6 +51,11 @@ def _maybe_add_token(chunk: str, out_tokens: list[str]) -> None:
 
 
 def extract_file_tokens(line: str) -> list[str]:
+    # Prefer whole-line path first to support unquoted names with spaces,
+    line_token = line.strip().strip('"').strip("'").rstrip(",;)")
+    if line_token and Path(line_token).suffix.lower() in TOKEN_EXTENSIONS:
+        return [line_token]
+
     tokens: list[str] = []
     chunk_chars: list[str] = []
     in_quote = False
@@ -137,32 +156,6 @@ def extract_texture_tokens_from_binary(content: bytes | str) -> set[str]:
 
     return cleaned_matches
 
-# todo: fix parsing the texture from o3d
-# reference: https://github.com/lmaodick1239/OMSI-FilePacker
-def extract_textures_from_o3d(file_path: Path):
-    """Parse textures from O3D files handling both rigid and fluid parts."""
-    data = file_path.read_bytes()
-    ascii_text = data.decode("latin-1", errors="ignore")
-    
-    # 1. Parse rigid part materials (material block markers)
-    material_matches = set(re.finditer(r'\.(r|l)(\d+)', ascii_text))
-    
-    # 2. Parse fluid part textures (determine displacement state)
-    fluid_textures = set()
-    with file_path.open("r", encoding="latin-1") as f:
-        for line in f:
-            if line.strip().startswith("Displacement="):
-                # Extract displacement file extension
-                match = re.search(r'Displacement="([^"]+)"', line)
-                if match:
-                    rel_path = match.group(1)
-                    candidate = file_path.parent / Path(rel_path).parent / Path(rel_path).name
-                    if candidate.suffix.lower() in TEXTURE_EXTENSIONS:
-                        fluid_textures.add(candidate)
-    
-    return material_matches | fluid_textures
-
-
 def _parse_blender_o3d(buff: bytes, header_idx: int) -> set[str]:
     """Fallback handler for Blender-generated OMSIS3D files."""
     offset = header_idx + 7
@@ -226,6 +219,7 @@ def resolve_existing_path(
         base_dir: Path,
         bus_root: Path,
         model_root: Path | None = None,
+        out_of_bus: set[str] | None = None,
 ) -> Path | None:
     raw_rel = normalize_rel_path(raw_path)
     candidate_values = []
@@ -249,13 +243,19 @@ def resolve_existing_path(
     candidate_values.append(base_dir / rel_no_lead)
 
     checked = set()
+    any_within_bus = False
     for candidate in candidate_values:
         resolved = candidate.resolve()
         if resolved in checked:
             continue
         checked.add(resolved)
+        if not is_within_bus_root(resolved, bus_root):
+            continue
+        any_within_bus = True
         if resolved.exists() and resolved.is_file():
             return resolved
+    if not any_within_bus and out_of_bus is not None:
+        out_of_bus.add(raw_rel)
     return None
 
 
@@ -297,11 +297,12 @@ def parse_bus_for_model_cfgs(bus_file: Path, bus_root: Path) -> set[Path]:
 def parse_cfg_dependencies(
         start_cfgs: set[Path],
         bus_root: Path,
-) -> tuple[set[Path], set[Path], list[str], set[str]]:
+) -> tuple[set[Path], set[Path], list[str], set[str], set[str]]:
     all_cfgs: set[Path] = set()
     all_o3d: set[Path] = set()
     missing_paths: list[str] = []
     cfg_texture_tokens: set[str] = set()
+    out_of_bus: set[str] = set()
 
     queue = sorted(start_cfgs)
     seen_cfgs: set[Path] = set()
@@ -328,7 +329,11 @@ def parse_cfg_dependencies(
                     continue
 
                 resolved = resolve_existing_path(
-                    token, cfg_file.parent, bus_root, model_root=model_root
+                    token,
+                    cfg_file.parent,
+                    bus_root,
+                    model_root=model_root,
+                    out_of_bus=out_of_bus,
                 )
                 if resolved is None:
                     missing_paths.append(f"{cfg_file.name}: {token}")
@@ -339,7 +344,7 @@ def parse_cfg_dependencies(
                 elif suffix == ".cfg" and resolved not in seen_cfgs:
                     queue.append(resolved)
 
-    return all_cfgs, all_o3d, missing_paths, cfg_texture_tokens
+    return all_cfgs, all_o3d, missing_paths, cfg_texture_tokens, out_of_bus
 
 
 def build_texture_index(texture_root: Path) -> tuple[dict[str, Path], dict[str, list[Path]]]:
@@ -367,6 +372,8 @@ def resolve_texture_token(
         texture_root: Path,
         by_relpath: dict[str, Path],
         by_basename: dict[str, list[Path]],
+        bus_root: Path,
+        out_of_bus: set[str] | None = None,
 ) -> set[Path]:
     normalized = normalize_rel_path(token)
     normalized = normalized.lstrip("\\")
@@ -382,7 +389,10 @@ def resolve_texture_token(
         candidates.add(rel_match)
 
     direct_path = (texture_root / normalized).resolve()
-    if direct_path.exists() and direct_path.is_file():
+    if not is_within_bus_root(direct_path, bus_root):
+        if out_of_bus is not None:
+            out_of_bus.add(normalized)
+    elif direct_path.exists() and direct_path.is_file():
         candidates.add(direct_path)
 
     # Fallback by filename if relative path was not found.
@@ -403,26 +413,34 @@ def gather_textures(
         texture_root: Path,
         cfg_texture_tokens: set[str],
         o3d_files: set[Path],
-) -> tuple[set[Path], set[str]]:
+        bus_root: Path,
+) -> tuple[set[Path], set[str], set[str]]:
     by_relpath, by_basename = build_texture_index(texture_root)
     all_tokens: set[str] = set(cfg_texture_tokens)
     unresolved: set[str] = set()
+    out_of_bus: set[str] = set()
     resolved_textures: set[Path] = set()
 
     for o3d_file in o3d_files:
-        all_tokens.update(extract_textures_from_o3d(o3d_file))
+        all_tokens.update(parse_o3d_textures(o3d_file))
 
     for token in sorted(all_tokens):
         if Path(token).suffix.lower() not in TEXTURE_EXTENSIONS:
             continue
         matches = resolve_texture_token(
-            token, texture_root, by_relpath, by_basename)
+            token,
+            texture_root,
+            by_relpath,
+            by_basename,
+            bus_root,
+            out_of_bus=out_of_bus,
+        )
         if not matches:
             unresolved.add(token)
             continue
         resolved_textures.update(matches)
 
-    return resolved_textures, unresolved
+    return resolved_textures, unresolved, out_of_bus
 
 
 def print_relative_file_list(title: str, files: set[Path], bus_root: Path) -> None:
@@ -431,9 +449,18 @@ def print_relative_file_list(title: str, files: set[Path], bus_root: Path) -> No
         print(f"  {file_path.relative_to(bus_root).as_posix()}")
 
 
-def copy_files_to_output(files: set[Path], bus_root: Path, output_dir: Path) -> None:
+def copy_files_to_output(
+        files: set[Path],
+        bus_root: Path,
+        output_dir: Path,
+        out_of_bus: set[str] | None = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for source in files:
+        if not is_within_bus_root(source, bus_root):
+            if out_of_bus is not None:
+                out_of_bus.add(str(source))
+            continue
         relative = source.relative_to(bus_root)
         target = output_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -483,11 +510,12 @@ def main() -> None:
     if not model_cfgs:
         raise RuntimeError(f"No model cfg references found in: {bus_file}")
 
-    all_cfgs, all_o3d, missing_model_refs, cfg_texture_tokens = parse_cfg_dependencies(
-        model_cfgs, bus_root
+    all_cfgs, all_o3d, missing_model_refs, cfg_texture_tokens, out_of_bus = (
+        parse_cfg_dependencies(model_cfgs, bus_root)
     )
-    textures, unresolved_textures = gather_textures(
-        texture_root, cfg_texture_tokens, all_o3d)
+    textures, unresolved_textures, texture_out_of_bus = gather_textures(
+        texture_root, cfg_texture_tokens, all_o3d, bus_root)
+    out_of_bus = out_of_bus | texture_out_of_bus
 
     model_files = all_cfgs | all_o3d
 
@@ -508,8 +536,14 @@ def main() -> None:
         for item in sorted(unresolved_textures):
             print(f"  {item}")
 
+    if out_of_bus:
+        print(f"\ntexture/file out of bus ({len(out_of_bus)}):")
+        for item in sorted(out_of_bus):
+            print(f"  {item}")
+
     files_to_copy = model_files | textures
-    copy_files_to_output(files_to_copy, bus_root, output_dir)
+    copy_files_to_output(
+        files_to_copy, bus_root, output_dir, out_of_bus=out_of_bus)
     print(f"\nCopied {len(files_to_copy)} files to: {output_dir}")
 
 

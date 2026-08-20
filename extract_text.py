@@ -1,6 +1,15 @@
 import glob
 import os
 import shutil
+from pathlib import Path
+
+
+def is_within_bus_root(path: Path, bus_root: Path) -> bool:
+    try:
+        path.resolve().relative_to(bus_root.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def get_bus_file(directory):
@@ -43,15 +52,22 @@ def locate_bus_config_files(bus_path):
 
 def get_bus_config_file(bus_root_path, cofig_files, output_path):
     missing_file = set()
-    os.makedirs(output_path, exist_ok=True)
+    out_of_bus = set()
+    bus_root = Path(bus_root_path).resolve()
+    output_dir = Path(output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
     for file in cofig_files:
-        full_path = os.path.join(bus_root_path, file)
-        if not os.path.exists(full_path):
+        source = (bus_root / file).resolve()
+        if not is_within_bus_root(source, bus_root):
+            out_of_bus.add(file)
+            print(f"{file} is outside the bus folder; skipped")
+            continue
+        if not source.exists():
             missing_file.add(file)
             print(f"{file} not found")
-        else:
-            file_dir, _ = os.path.split(file)
-            os.makedirs(os.path.join(output_path, file_dir), exist_ok=True)
-            new_path = os.path.join(output_path, file)
-            shutil.copy(full_path, new_path)
-    return missing_file
+            continue
+        relative = source.relative_to(bus_root)
+        target = output_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(source, target)
+    return missing_file, out_of_bus

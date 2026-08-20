@@ -18,6 +18,7 @@ class ExtractionSummary:
     missing_model: set[str]
     unresolved_textures: set[str]
     unresolved_sound: set[str]
+    out_of_bus_files: set[str]
     texture_hook_results: list[str]
 
 
@@ -25,8 +26,9 @@ def run_text_extraction(
         bus_root: Path,
         output_dir: Path,
         selected_buses: list[Path],
-) -> set[str]:
+) -> tuple[set[str], set[str]]:
     missing: set[str] = set()
+    out_of_bus: set[str] = set()
     bus_files = [str(path) for path in selected_buses]
 
     text_files = set()
@@ -36,52 +38,52 @@ def run_text_extraction(
     text_files.update(extract_text.extract_bus_name(bus_files))
     text_files.update(extract_text.get_hof_name(str(bus_root)))
 
-    missing.update(
-        extract_text.get_bus_config_file(
-            str(bus_root),
-            text_files,
-            str(output_dir),
-        )
+    missing, out_of_bus = extract_text.get_bus_config_file(
+        str(bus_root),
+        text_files,
+        str(output_dir),
     )
-    return missing
+    return missing, out_of_bus
 
 
 def run_model_extraction(
         bus_root: Path,
         output_dir: Path,
         selected_bus: Path,
-) -> tuple[list[str], set[str]]:
+) -> tuple[list[str], set[str], set[str]]:
     model_cfgs = extract_model.parse_bus_for_model_cfgs(selected_bus, bus_root)
     if not model_cfgs:
-        return [f"No model cfg references found in: {selected_bus.name}"], set()
+        return [f"No model cfg references found in: {selected_bus.name}"], set(), set()
 
-    all_cfgs, all_o3d, missing_model_refs, cfg_texture_tokens = extract_model.parse_cfg_dependencies(
+    all_cfgs, all_o3d, missing_model_refs, cfg_texture_tokens, out_of_bus = extract_model.parse_cfg_dependencies(
         model_cfgs, bus_root
     )
-    textures, unresolved_textures = extract_model.gather_textures(
-        bus_root / "Texture", cfg_texture_tokens, all_o3d
+    textures, unresolved_textures, texture_out_of_bus = extract_model.gather_textures(
+        bus_root / "Texture", cfg_texture_tokens, all_o3d, bus_root
     )
+    out_of_bus = out_of_bus | texture_out_of_bus
 
     files_to_copy = all_cfgs | all_o3d | textures
-    extract_model.copy_files_to_output(files_to_copy, bus_root, output_dir)
-    return sorted(set(missing_model_refs)), unresolved_textures
+    extract_model.copy_files_to_output(
+        files_to_copy, bus_root, output_dir, out_of_bus=out_of_bus)
+    return sorted(set(missing_model_refs)), unresolved_textures, out_of_bus
 
 
 def run_sound_extraction(
         bus_root: Path,
         output_dir: Path,
         selected_bus: Path,
-) -> set[str]:
+) -> tuple[set[str], set[str]]:
     sound_cfgs = extract_sound.parse_bus_for_sound_cfgs(selected_bus, bus_root)
     if not sound_cfgs:
-        return {f"No sound cfg references found in: {selected_bus.name}"}
+        return {f"No sound cfg references found in: {selected_bus.name}"}, set()
 
-    cfg_files, audio_files, unresolved_sound = extract_sound.parse_sound_dependencies(
+    cfg_files, audio_files, unresolved_sound, out_of_bus = extract_sound.parse_sound_dependencies(
         sound_cfgs, bus_root
     )
     extract_sound.copy_files_to_output(
-        cfg_files | audio_files, bus_root, output_dir)
-    return unresolved_sound
+        cfg_files | audio_files, bus_root, output_dir, out_of_bus=out_of_bus)
+    return unresolved_sound, out_of_bus
 
 
 def run_texture_extraction_if_available(
@@ -159,7 +161,8 @@ def run_extraction_pipeline(
         output_dir: Path,
         selected_buses: list[Path],
 ) -> ExtractionSummary:
-    missing_text = run_text_extraction(bus_root, output_dir, selected_buses)
+    missing_text, out_of_bus_text = run_text_extraction(bus_root, output_dir, selected_buses)
+    out_of_bus: set[str] = set(out_of_bus_text)
 
     missing_model: set[str] = set()
     unresolved_textures: set[str] = set()
@@ -169,19 +172,21 @@ def run_extraction_pipeline(
     print("[2/3] Extracting model/texture files...")
     for selected_bus in selected_buses:
         print(f"  Processing: {selected_bus.name}")
-        missing_model_for_bus, unresolved_textures_for_bus = run_model_extraction(
+        missing_model_for_bus, unresolved_textures_for_bus, out_of_bus_for_bus = run_model_extraction(
             bus_root, output_dir, selected_bus
         )
         missing_model.update(missing_model_for_bus)
         unresolved_textures.update(unresolved_textures_for_bus)
+        out_of_bus.update(out_of_bus_for_bus)
 
     print("[3/3] Extracting sound files...")
     for selected_bus in selected_buses:
         print(f"  Processing: {selected_bus.name}")
-        unresolved_sound_for_bus = run_sound_extraction(
+        unresolved_sound_for_bus, out_of_bus_for_bus = run_sound_extraction(
             bus_root, output_dir, selected_bus
         )
         unresolved_sound.update(unresolved_sound_for_bus)
+        out_of_bus.update(out_of_bus_for_bus)
 
     # print("[4/4] Running extract_texture hook...")
     # for selected_bus in selected_buses:
@@ -197,6 +202,7 @@ def run_extraction_pipeline(
         missing_model=missing_model,
         unresolved_textures=unresolved_textures,
         unresolved_sound=unresolved_sound,
+        out_of_bus_files=out_of_bus,
         texture_hook_results=texture_hook_results,
     )
 
@@ -206,6 +212,7 @@ def print_summary(summary: ExtractionSummary) -> None:
     missing_model = summary.missing_model
     unresolved_textures = summary.unresolved_textures
     unresolved_sound = summary.unresolved_sound
+    out_of_bus_files = summary.out_of_bus_files
     texture_hook_results = summary.texture_hook_results
 
     print("\nSummary:")
@@ -213,6 +220,7 @@ def print_summary(summary: ExtractionSummary) -> None:
     print(f"  Missing model refs: {len(missing_model)}")
     print(f"  Unresolved textures: {len(unresolved_textures)}")
     print(f"  Unresolved sounds: {len(unresolved_sound)}")
+    print(f"  texture/file out of bus: {len(out_of_bus_files)}")
     print(f"  Texture hook entries: {len(texture_hook_results)}")
 
     if missing_text:
@@ -233,6 +241,11 @@ def print_summary(summary: ExtractionSummary) -> None:
     if unresolved_sound:
         print("\nUnresolved sound tokens:")
         for item in sorted(unresolved_sound):
+            print(f"  {item}")
+
+    if out_of_bus_files:
+        print("\ntexture/file out of bus:")
+        for item in sorted(out_of_bus_files):
             print(f"  {item}")
 
     print("\nTexture hook results:")
