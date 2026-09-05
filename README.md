@@ -4,3 +4,8 @@
 ```sh
 uv run pyinstaller --onefile --noconsole main.py
 ```
+
+## Todo
+- [] auto detect file encoding
+- [] add more logging when error (maybe add a log file)
+- [] allow files that are out of the bus directory
