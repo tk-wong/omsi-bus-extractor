@@ -33,11 +33,6 @@ def resolve_within_bus_root(candidate: Path, bus_root: Path) -> Path | None:
     return None
 
 
-def is_comment_or_empty(line: str) -> bool:
-    stripped = line.strip()
-    return not stripped or stripped.startswith(";") or stripped.startswith("//")
-
-
 def _maybe_add_token(chunk: str, out_tokens: list[str]) -> None:
     token = chunk.strip().strip('"').strip("'")
     if not token:
@@ -156,8 +151,6 @@ def parse_bus_for_sound_cfgs(bus_file: Path, bus_root: Path) -> set[Path]:
             continue
 
         if expecting_sound_path:
-            if is_comment_or_empty(stripped):
-                continue
             candidate = resolve_existing_path(
                 stripped, bus_file.parent, bus_root)
             if candidate and candidate.suffix.lower() == ".cfg":

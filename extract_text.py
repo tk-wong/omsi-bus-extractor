@@ -42,7 +42,7 @@ def locate_bus_config_files(bus_path):
         return set()
     suffix_list = (".cfg", ".txt", ".org", ".osc")
     file_set = set()
-    with open(bus_path, encoding="utf-8") as f:
+    with open(bus_path, encoding="ansi") as f:
         for lines in f:
             strip_line = lines.strip()
             if strip_line.endswith(suffix_list):
